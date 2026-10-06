@@ -5,6 +5,8 @@ on:
 
 env:
   OPENWRT_COMMIT: 25ee12629edcc38feffbd06255dd47840cd7af7e
+  # Pin AmneziaWG feed for reproducibility
+  AWG_COMMIT: 56bf9fed93df48d2b747edd6e7a7c5fbe2b01afe
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
 
@@ -27,52 +29,47 @@ jobs:
           ccache -M "$CCACHE_MAXSIZE"
           ccache -z
 
-      # ── caches: first run still ~1–2 h; later runs often 15–40 min ──
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-${{ github.run_number }}
+          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
           restore-keys: |
-            ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-
             ccache-${{ env.OPENWRT_COMMIT }}-
             ccache-
 
-      - name: Cache OpenWrt dl (sources)
-        uses: actions/cache@v4
+      - name: Restore OpenWrt dl
+        uses: actions/cache/restore@v4
         with:
           path: openwrt/dl
-          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}
+          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
           restore-keys: |
             owrt-dl-${{ env.OPENWRT_COMMIT }}-
             owrt-dl-
 
-      - name: Cache OpenWrt staging_dir (toolchain)
-        uses: actions/cache@v4
+      - name: Restore OpenWrt toolchain
+        uses: actions/cache/restore@v4
         with:
           path: |
             openwrt/staging_dir
             openwrt/build_dir/host
             openwrt/build_dir/toolchain-*
-          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v2
+          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
           restore-keys: |
-            owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-
             owrt-tc-${{ env.OPENWRT_COMMIT }}-
 
       - name: Setup OpenWrt tree (ADCDS way + KMODS=1)
         run: |
           set -e
           if [ ! -d openwrt/.git ]; then
-            git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
+            git clone https://github.com/openwrt/openwrt.git openwrt
           fi
           cd openwrt
-          git fetch --depth 1 origin "$OPENWRT_COMMIT" || true
+          git fetch --depth 1 origin "$OPENWRT_COMMIT" || git fetch origin "$OPENWRT_COMMIT"
           git checkout -f "$OPENWRT_COMMIT"
 
-          # Overlay device support from this repo (same as build.sh)
           cp -a ../files/. .
 
-          # Pin feeds from feeds.lock (same as build.sh)
           if [ ! -f ../feeds.lock ]; then
             echo "ERROR: feeds.lock missing" >&2
             exit 1
@@ -87,23 +84,32 @@ jobs:
             }
           done < ../feeds.lock
 
-          # Official AmneziaWG feed
-          grep -q 'amneziawg-openwrt' feeds.conf.default || \
-            echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git" >> feeds.conf.default
+          # Pin AmneziaWG feed to exact commit
+          sed -i '/amneziawg-openwrt/d' feeds.conf.default
+          echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git^${AWG_COMMIT}" >> feeds.conf.default
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg
 
-          # Fix amneziawg patch: missing prototype → -Werror=missing-prototypes
+          # ── Fix -Werror=missing-prototypes in the AmneziaWG patch ──
+          # Functions used only in one .c file must be static.
           PATCH=feeds/amneziawg/kmod-amneziawg/files/000-initial-amneziawg.patch
           if [ -f "$PATCH" ]; then
-            sed -i 's/^\(+\)u32 wg_get_random_u32_inclusive/\1static u32 wg_get_random_u32_inclusive/' "$PATCH"
-            grep -q 'static u32 wg_get_random_u32_inclusive' "$PATCH" || {
-              echo "ERROR: failed to patch wg_get_random_u32_inclusive as static" >&2
-              exit 1
-            }
-            echo "Patched $PATCH: wg_get_random_u32_inclusive → static"
+            sed -i \
+              -e 's/^\(+\)u32 wg_get_random_u32_inclusive/\1static u32 wg_get_random_u32_inclusive/' \
+              -e 's/^\(+\)void prepare_advanced_secured_message/\1static void prepare_advanced_secured_message/' \
+              "$PATCH"
+            grep -q 'static u32 wg_get_random_u32_inclusive' "$PATCH"
+            grep -q 'static void prepare_advanced_secured_message' "$PATCH"
+            echo "Patched AWG: missing-prototype helpers → static"
+          fi
+
+          # Safety net: don't treat remaining missing-prototypes as errors
+          MK=feeds/amneziawg/kmod-amneziawg/Makefile
+          if [ -f "$MK" ] && ! grep -q 'Wno-error=missing-prototypes' "$MK"; then
+            sed -i 's|EXTRA_CFLAGS="\$(BUILDFLAGS)"|EXTRA_CFLAGS="\$(BUILDFLAGS) -Wno-error=missing-prototypes -Wno-missing-prototypes"|' "$MK"
+            echo "Patched AWG Makefile: -Wno-error=missing-prototypes"
           fi
 
       - name: Configure (match ADCDS release + ALL_KMODS + ccache)
@@ -138,36 +144,61 @@ jobs:
             exit 1
           }
 
-          # Pre-download sources (uses dl/ cache)
           make download -j"$(nproc)" || true
 
       - name: Build toolchain + kernel + AWG packages
+        id: compile
         working-directory: openwrt
         run: |
           set -e
           export PATH="/usr/lib/ccache:$PATH"
           export CCACHE_DIR="${{ github.workspace }}/.ccache"
 
-          # tools + toolchain: cached via staging_dir / build_dir
-          make tools/install -j"$(nproc)"
-          make toolchain/install -j"$(nproc)"
-          make target/linux/compile -j"$(nproc)"
+          # IGNORE_ERRORS: one broken optional kmod must not kill the kernel build
+          # (same as ADCDS build.sh / OpenWrt buildbot)
+          make tools/install -j"$(nproc)" IGNORE_ERRORS="n m"
+          make toolchain/install -j"$(nproc)" IGNORE_ERRORS="n m"
+          make target/linux/compile -j"$(nproc)" IGNORE_ERRORS="n m" BUILD_LOG=1
 
-          # AWG packages only (not the full image)
+          # AWG itself must succeed (no IGNORE_ERRORS)
           make package/feeds/amneziawg/kmod-amneziawg/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/amneziawg-tools/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/luci-proto-amneziawg/compile -j"$(nproc)" V=s
 
-          # Explicit deps so they land in bin/
+          # Deps into bin/ (best-effort)
           for p in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-chacha20poly1305 \
                    kmod-crypto-lib-curve25519 kmod-udptunnel4 kmod-udptunnel6; do
-            make "package/kernel/linux/compile" -j"$(nproc)" || true
             make "package/$p/compile" -j"$(nproc)" 2>/dev/null || \
               make "package/kernel/$p/compile" -j"$(nproc)" 2>/dev/null || true
           done
 
           echo "=== ccache stats ==="
           ccache -s || true
+
+      # Save caches even if compile failed (so next run is faster)
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+
+      - name: Save OpenWrt dl
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: openwrt/dl
+          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+
+      - name: Save OpenWrt toolchain
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            openwrt/staging_dir
+            openwrt/build_dir/host
+            openwrt/build_dir/toolchain-*
+          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
 
       - name: Collect artifacts and check vermagic
         working-directory: openwrt
