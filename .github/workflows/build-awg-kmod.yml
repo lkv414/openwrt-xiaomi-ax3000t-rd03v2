@@ -20,7 +20,7 @@ jobs:
             python3 python3-setuptools rsync unzip zlib1g-dev file wget ccache \
             libelf-dev python3-dev
 
-      - name: Setup OpenWrt tree (ADCDS way)
+      - name: Setup OpenWrt tree (ADCDS way + KMODS=1)
         run: |
           set -e
           git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
@@ -28,76 +28,147 @@ jobs:
           git fetch --depth 1 origin 25ee12629edcc38feffbd06255dd47840cd7af7e
           git checkout 25ee12629edcc38feffbd06255dd47840cd7af7e
 
-          # Overlay device support from this repo
+          # Overlay device support from this repo (same as build.sh)
           cp -a ../files/. .
 
-          # Pin feeds from feeds.lock
-          if [ -f ../feeds.lock ]; then
-            while read -r feed rev; do
-              case "$feed" in ''|'#'*) continue ;; esac
-              grep -q "^src-git $feed " feeds.conf.default || continue
-              sed -i "s#^src-git $feed \([^;^ ]*\).*#src-git $feed \1^$rev#" feeds.conf.default
-            done < ../feeds.lock
+          # Pin feeds from feeds.lock (same as build.sh)
+          if [ ! -f ../feeds.lock ]; then
+            echo "ERROR: feeds.lock missing" >&2
+            exit 1
           fi
+          while read -r feed rev; do
+            case "$feed" in ''|'#'*) continue ;; esac
+            grep -q "^src-git $feed " feeds.conf.default || continue
+            sed -i "s#^src-git $feed \([^;^ ]*\).*#src-git $feed \1^$rev#" feeds.conf.default
+            grep -q "^src-git $feed [^ ]*\^$rev\$" feeds.conf.default || {
+              echo "ERROR: could not pin feed $feed to $rev" >&2
+              exit 1
+            }
+          done < ../feeds.lock
 
-          # Add AmneziaWG feed (AWG 3.1)
-          echo "src-git amneziawg https://github.com/this-username-has-been-taken/amneziawg-openwrt.git" >> feeds.conf.default
+          # Official AmneziaWG feed
+          echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git" >> feeds.conf.default
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-          ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg || true
+          ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg
 
-      - name: Configure for RD03v2 + AWG
+      - name: Configure (match ADCDS release + ALL_KMODS)
         working-directory: openwrt
         run: |
           set -e
-          # Minimal config for the device
+          # Same package set as ADCDS build.sh, plus CONFIG_ALL_KMODS=y
+          # so vermagic matches the release image the user runs.
+          #
+          # From build.sh:
+          #   .vermagic is md5 over sorted '=[ym]' Kernel-Config symbols.
+          #   KMODS=1 sets every kmod to m → different vermagic than lean build.
+          #   Release images are built with KMODS=1; kmods only install on same run.
           cat > .config << 'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq50xx=y
           CONFIG_TARGET_qualcommax_ipq50xx_DEVICE_xiaomi_mi-router-ax3000t-v2=y
           CONFIG_TARGET_ROOTFS_INITRAMFS=y
-          # Packages we need
-          CONFIG_PACKAGE_kmod-amneziawg=y
+          CONFIG_PACKAGE_wpad-mbedtls=y
+          # CONFIG_PACKAGE_wpad-basic-mbedtls is not set
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_ethtool=y
+          CONFIG_PACKAGE_i2c-tools=y
+          CONFIG_ALL_KMODS=y
+          CONFIG_PACKAGE_kmod-amneziawg=m
           CONFIG_PACKAGE_amneziawg-tools=y
           CONFIG_PACKAGE_luci-proto-amneziawg=y
-          # Keep image lean
-          CONFIG_ALL_KMODS=n
-          CONFIG_ALL=n
           EOF
-          # Strip leading spaces from heredoc (YAML needs indent, shell does not)
           sed -i 's/^[[:space:]]*//' .config
           make defconfig
 
-      - name: Build only AWG packages
+          # Sanity: ALL_KMODS must stay on after defconfig
+          grep -q '^CONFIG_ALL_KMODS=y$' .config || {
+            echo "ERROR: CONFIG_ALL_KMODS was lost after defconfig" >&2
+            exit 1
+          }
+
+      - name: Build toolchain + kernel + AWG packages
         working-directory: openwrt
         run: |
           set -e
-          # First build toolchain + kernel so vermagic matches
-          make tools/install -j$(nproc)
-          make toolchain/install -j$(nproc)
-          make target/linux/compile -j$(nproc)
+          make tools/install -j"$(nproc)"
+          make toolchain/install -j"$(nproc)"
+          make target/linux/compile -j"$(nproc)"
 
-          # Now the packages
-          make package/kmod-amneziawg/compile -j$(nproc) V=s || make package/feeds/amneziawg/kmod-amneziawg/compile -j$(nproc) V=s
-          make package/amneziawg-tools/compile -j$(nproc) || true
-          make package/luci-proto-amneziawg/compile -j$(nproc) || true
+          # Compile AWG + its kernel deps (crypto/udptunnel come via ALL_KMODS)
+          make package/feeds/amneziawg/kmod-amneziawg/compile -j"$(nproc)" V=s
+          make package/feeds/amneziawg/amneziawg-tools/compile -j"$(nproc)" V=s
+          make package/feeds/amneziawg/luci-proto-amneziawg/compile -j"$(nproc)" V=s
 
-          # Collect artifacts
+          # Also build the six hard deps explicitly so they are in bin/
+          for p in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-chacha20poly1305 \
+                   kmod-crypto-lib-curve25519 kmod-udptunnel4 kmod-udptunnel6; do
+            make "package/kernel/linux/compile" -j"$(nproc)" || true
+            make "package/$p/compile" -j"$(nproc)" 2>/dev/null || \
+              make "package/kernel/$p/compile" -j"$(nproc)" 2>/dev/null || true
+          done
+
+      - name: Collect artifacts and check vermagic
+        working-directory: openwrt
+        run: |
+          set -e
           mkdir -p /tmp/awg-out
-          find bin \( -name 'kmod-amneziawg*.apk' -o -name 'amneziawg-tools*.apk' -o -name 'luci-proto-amneziawg*.apk' \) 2>/dev/null | while read f; do
+
+          # Prefer packages/ under the target (where ALL_KMODS puts kmods)
+          find bin -type f \( \
+            -name 'kmod-amneziawg*.apk' -o -name 'kmod-amneziawg*.ipk' -o \
+            -name 'amneziawg-tools*.apk' -o -name 'amneziawg-tools*.ipk' -o \
+            -name 'luci-proto-amneziawg*.apk' -o -name 'luci-proto-amneziawg*.ipk' -o \
+            -name 'kmod-crypto-kpp*.apk' -o -name 'kmod-crypto-kpp*.ipk' -o \
+            -name 'kmod-crypto-lib-chacha20*.apk' -o -name 'kmod-crypto-lib-chacha20*.ipk' -o \
+            -name 'kmod-crypto-lib-chacha20poly1305*.apk' -o -name 'kmod-crypto-lib-chacha20poly1305*.ipk' -o \
+            -name 'kmod-crypto-lib-curve25519*.apk' -o -name 'kmod-crypto-lib-curve25519*.ipk' -o \
+            -name 'kmod-udptunnel4*.apk' -o -name 'kmod-udptunnel4*.ipk' -o \
+            -name 'kmod-udptunnel6*.apk' -o -name 'kmod-udptunnel6*.ipk' \
+          \) -print0 | while IFS= read -r -d '' f; do
             cp -v "$f" /tmp/awg-out/
           done
-          ls -la /tmp/awg-out/ || echo "No .apk found, trying .ipk"
-          find bin \( -name 'kmod-amneziawg*.ipk' -o -name 'amneziawg-tools*.ipk' -o -name 'luci-proto-amneziawg*.ipk' \) 2>/dev/null | while read f; do
-            cp -v "$f" /tmp/awg-out/
-          done
+
+          echo "=== Artifacts ==="
           ls -la /tmp/awg-out/
+
+          # Must have the three AWG packages
+          test -n "$(ls /tmp/awg-out/kmod-amneziawg* 2>/dev/null)" || {
+            echo "ERROR: kmod-amneziawg not built" >&2
+            exit 1
+          }
+          test -n "$(ls /tmp/awg-out/amneziawg-tools* 2>/dev/null)" || {
+            echo "ERROR: amneziawg-tools not built" >&2
+            exit 1
+          }
+          test -n "$(ls /tmp/awg-out/luci-proto-amneziawg* 2>/dev/null)" || {
+            echo "ERROR: luci-proto-amneziawg not built" >&2
+            exit 1
+          }
+
+          # Report vermagic from built kernel module if present
+          if command -v modinfo >/dev/null 2>&1; then
+            ko=$(find build_dir -name 'amneziawg.ko' 2>/dev/null | head -1)
+            if [ -n "$ko" ]; then
+              echo "=== vermagic from amneziawg.ko ==="
+              modinfo "$ko" | grep -E 'vermagic|version' || true
+            fi
+          fi
+          # Also dump the kernel package version string OpenWrt embeds
+          if [ -f .vermagic ]; then
+            echo "=== .vermagic ==="
+            cat .vermagic
+          fi
+          find bin -name 'kernel_*.apk' -o -name 'kernel_*.ipk' 2>/dev/null | head -5 || true
 
       - name: Upload AWG packages
         uses: actions/upload-artifact@v4
         with:
-          name: awg-kmod-adcds-r35297
+          name: awg-kmod-adcds-allkmods
           path: /tmp/awg-out/*
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
