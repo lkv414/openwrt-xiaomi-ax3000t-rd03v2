@@ -53,6 +53,21 @@ jobs:
           ./scripts/feeds install -a
           ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg
 
+          # Fix amneziawg patch: wg_get_random_u32_inclusive has no prototype
+          # and is not static → -Werror=missing-prototypes fails the build on
+          # modern kernels (6.12). Function is only used in send.c → make static.
+          PATCH=feeds/amneziawg/kmod-amneziawg/files/000-initial-amneziawg.patch
+          if [ -f "$PATCH" ]; then
+            sed -i 's/^\(+\)u32 wg_get_random_u32_inclusive/\1static u32 wg_get_random_u32_inclusive/' "$PATCH"
+            grep -q 'static u32 wg_get_random_u32_inclusive' "$PATCH" || {
+              echo "ERROR: failed to patch wg_get_random_u32_inclusive as static" >&2
+              exit 1
+            }
+            echo "Patched $PATCH: wg_get_random_u32_inclusive → static"
+          else
+            echo "WARNING: $PATCH not found, hoping upstream already fixed it"
+          fi
+
       - name: Configure (match ADCDS release + ALL_KMODS)
         working-directory: openwrt
         run: |
