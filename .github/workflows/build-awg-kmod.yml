@@ -3,6 +3,11 @@ name: Build AWG kmod (AmneziaWG 3.1)
 on:
   workflow_dispatch:
 
+env:
+  OPENWRT_COMMIT: 25ee12629edcc38feffbd06255dd47840cd7af7e
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,14 +24,50 @@ jobs:
             gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
             python3 python3-setuptools rsync unzip zlib1g-dev file wget ccache \
             libelf-dev python3-dev
+          ccache -M "$CCACHE_MAXSIZE"
+          ccache -z
+
+      # ── caches: first run still ~1–2 h; later runs often 15–40 min ──
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-
+            ccache-${{ env.OPENWRT_COMMIT }}-
+            ccache-
+
+      - name: Cache OpenWrt dl (sources)
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}
+          restore-keys: |
+            owrt-dl-${{ env.OPENWRT_COMMIT }}-
+            owrt-dl-
+
+      - name: Cache OpenWrt staging_dir (toolchain)
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/staging_dir
+            openwrt/build_dir/host
+            openwrt/build_dir/toolchain-*
+          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v2
+          restore-keys: |
+            owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-
+            owrt-tc-${{ env.OPENWRT_COMMIT }}-
 
       - name: Setup OpenWrt tree (ADCDS way + KMODS=1)
         run: |
           set -e
-          git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
+          if [ ! -d openwrt/.git ]; then
+            git clone --depth 1 https://github.com/openwrt/openwrt.git openwrt
+          fi
           cd openwrt
-          git fetch --depth 1 origin 25ee12629edcc38feffbd06255dd47840cd7af7e
-          git checkout 25ee12629edcc38feffbd06255dd47840cd7af7e
+          git fetch --depth 1 origin "$OPENWRT_COMMIT" || true
+          git checkout -f "$OPENWRT_COMMIT"
 
           # Overlay device support from this repo (same as build.sh)
           cp -a ../files/. .
@@ -47,15 +88,14 @@ jobs:
           done < ../feeds.lock
 
           # Official AmneziaWG feed
-          echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git" >> feeds.conf.default
+          grep -q 'amneziawg-openwrt' feeds.conf.default || \
+            echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git" >> feeds.conf.default
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg
 
-          # Fix amneziawg patch: wg_get_random_u32_inclusive has no prototype
-          # and is not static → -Werror=missing-prototypes fails the build on
-          # modern kernels (6.12). Function is only used in send.c → make static.
+          # Fix amneziawg patch: missing prototype → -Werror=missing-prototypes
           PATCH=feeds/amneziawg/kmod-amneziawg/files/000-initial-amneziawg.patch
           if [ -f "$PATCH" ]; then
             sed -i 's/^\(+\)u32 wg_get_random_u32_inclusive/\1static u32 wg_get_random_u32_inclusive/' "$PATCH"
@@ -64,21 +104,12 @@ jobs:
               exit 1
             }
             echo "Patched $PATCH: wg_get_random_u32_inclusive → static"
-          else
-            echo "WARNING: $PATCH not found, hoping upstream already fixed it"
           fi
 
-      - name: Configure (match ADCDS release + ALL_KMODS)
+      - name: Configure (match ADCDS release + ALL_KMODS + ccache)
         working-directory: openwrt
         run: |
           set -e
-          # Same package set as ADCDS build.sh, plus CONFIG_ALL_KMODS=y
-          # so vermagic matches the release image the user runs.
-          #
-          # From build.sh:
-          #   .vermagic is md5 over sorted '=[ym]' Kernel-Config symbols.
-          #   KMODS=1 sets every kmod to m → different vermagic than lean build.
-          #   Release images are built with KMODS=1; kmods only install on same run.
           cat > .config << 'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq50xx=y
@@ -96,30 +127,38 @@ jobs:
           CONFIG_PACKAGE_kmod-amneziawg=m
           CONFIG_PACKAGE_amneziawg-tools=y
           CONFIG_PACKAGE_luci-proto-amneziawg=y
+          CONFIG_CCACHE=y
+          CONFIG_DEVEL=y
           EOF
           sed -i 's/^[[:space:]]*//' .config
           make defconfig
 
-          # Sanity: ALL_KMODS must stay on after defconfig
           grep -q '^CONFIG_ALL_KMODS=y$' .config || {
             echo "ERROR: CONFIG_ALL_KMODS was lost after defconfig" >&2
             exit 1
           }
 
+          # Pre-download sources (uses dl/ cache)
+          make download -j"$(nproc)" || true
+
       - name: Build toolchain + kernel + AWG packages
         working-directory: openwrt
         run: |
           set -e
+          export PATH="/usr/lib/ccache:$PATH"
+          export CCACHE_DIR="${{ github.workspace }}/.ccache"
+
+          # tools + toolchain: cached via staging_dir / build_dir
           make tools/install -j"$(nproc)"
           make toolchain/install -j"$(nproc)"
           make target/linux/compile -j"$(nproc)"
 
-          # Compile AWG + its kernel deps (crypto/udptunnel come via ALL_KMODS)
+          # AWG packages only (not the full image)
           make package/feeds/amneziawg/kmod-amneziawg/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/amneziawg-tools/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/luci-proto-amneziawg/compile -j"$(nproc)" V=s
 
-          # Also build the six hard deps explicitly so they are in bin/
+          # Explicit deps so they land in bin/
           for p in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-chacha20poly1305 \
                    kmod-crypto-lib-curve25519 kmod-udptunnel4 kmod-udptunnel6; do
             make "package/kernel/linux/compile" -j"$(nproc)" || true
@@ -127,13 +166,15 @@ jobs:
               make "package/kernel/$p/compile" -j"$(nproc)" 2>/dev/null || true
           done
 
+          echo "=== ccache stats ==="
+          ccache -s || true
+
       - name: Collect artifacts and check vermagic
         working-directory: openwrt
         run: |
           set -e
           mkdir -p /tmp/awg-out
 
-          # Prefer packages/ under the target (where ALL_KMODS puts kmods)
           find bin -type f \( \
             -name 'kmod-amneziawg*.apk' -o -name 'kmod-amneziawg*.ipk' -o \
             -name 'amneziawg-tools*.apk' -o -name 'amneziawg-tools*.ipk' -o \
@@ -151,7 +192,6 @@ jobs:
           echo "=== Artifacts ==="
           ls -la /tmp/awg-out/
 
-          # Must have the three AWG packages
           test -n "$(ls /tmp/awg-out/kmod-amneziawg* 2>/dev/null)" || {
             echo "ERROR: kmod-amneziawg not built" >&2
             exit 1
@@ -165,7 +205,6 @@ jobs:
             exit 1
           }
 
-          # Report vermagic from built kernel module if present
           if command -v modinfo >/dev/null 2>&1; then
             ko=$(find build_dir -name 'amneziawg.ko' 2>/dev/null | head -1)
             if [ -n "$ko" ]; then
@@ -173,12 +212,10 @@ jobs:
               modinfo "$ko" | grep -E 'vermagic|version' || true
             fi
           fi
-          # Also dump the kernel package version string OpenWrt embeds
           if [ -f .vermagic ]; then
             echo "=== .vermagic ==="
             cat .vermagic
           fi
-          find bin -name 'kernel_*.apk' -o -name 'kernel_*.ipk' 2>/dev/null | head -5 || true
 
       - name: Upload AWG packages
         uses: actions/upload-artifact@v4
