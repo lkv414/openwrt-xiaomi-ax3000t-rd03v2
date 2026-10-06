@@ -53,18 +53,20 @@ jobs:
           set -e
           # Minimal config for the device
           cat > .config << 'EOF'
-CONFIG_TARGET_qualcommax=y
-CONFIG_TARGET_qualcommax_ipq50xx=y
-CONFIG_TARGET_qualcommax_ipq50xx_DEVICE_xiaomi_mi-router-ax3000t-v2=y
-CONFIG_TARGET_ROOTFS_INITRAMFS=y
-# Packages we need
-CONFIG_PACKAGE_kmod-amneziawg=y
-CONFIG_PACKAGE_amneziawg-tools=y
-CONFIG_PACKAGE_luci-proto-amneziawg=y
-# Keep image lean
-CONFIG_ALL_KMODS=n
-CONFIG_ALL=n
-EOF
+          CONFIG_TARGET_qualcommax=y
+          CONFIG_TARGET_qualcommax_ipq50xx=y
+          CONFIG_TARGET_qualcommax_ipq50xx_DEVICE_xiaomi_mi-router-ax3000t-v2=y
+          CONFIG_TARGET_ROOTFS_INITRAMFS=y
+          # Packages we need
+          CONFIG_PACKAGE_kmod-amneziawg=y
+          CONFIG_PACKAGE_amneziawg-tools=y
+          CONFIG_PACKAGE_luci-proto-amneziawg=y
+          # Keep image lean
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          EOF
+          # Strip leading spaces from heredoc (YAML needs indent, shell does not)
+          sed -i 's/^[[:space:]]*//' .config
           make defconfig
 
       - name: Build only AWG packages
@@ -83,11 +85,11 @@ EOF
 
           # Collect artifacts
           mkdir -p /tmp/awg-out
-          find bin -name 'kmod-amneziawg*.apk' -o -name 'amneziawg-tools*.apk' -o -name 'luci-proto-amneziawg*.apk' 2>/dev/null | while read f; do
+          find bin \( -name 'kmod-amneziawg*.apk' -o -name 'amneziawg-tools*.apk' -o -name 'luci-proto-amneziawg*.apk' \) 2>/dev/null | while read f; do
             cp -v "$f" /tmp/awg-out/
           done
           ls -la /tmp/awg-out/ || echo "No .apk found, trying .ipk"
-          find bin -name 'kmod-amneziawg*.ipk' -o -name 'amneziawg-tools*.ipk' -o -name 'luci-proto-amneziawg*.ipk' 2>/dev/null | while read f; do
+          find bin \( -name 'kmod-amneziawg*.ipk' -o -name 'amneziawg-tools*.ipk' -o -name 'luci-proto-amneziawg*.ipk' \) 2>/dev/null | while read f; do
             cp -v "$f" /tmp/awg-out/
           done
           ls -la /tmp/awg-out/
