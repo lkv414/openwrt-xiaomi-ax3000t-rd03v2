@@ -302,14 +302,21 @@ jobs:
             exit 1
           }
 
-          # Kernel dependency check via binary grep (apk is ADB, not tar)
-          echo "=== kernel dependency check (want ${EXPECTED_VERMAGIC}) ==="
-          for f in /tmp/awg-out/kmod-*.apk; do
-            got=$(grep -a -o -m1 '6\.12\.94~[0-9a-f]\{32\}' "$f" || true)
-            echo "$(basename "$f"): ${got:-not-found}"
-          done
-          grep -a -q "6.12.94~${EXPECTED_VERMAGIC}" /tmp/awg-out/kmod-amneziawg*.apk || {
-            echo "ERROR: kmod-amneziawg depends on a different kernel" >&2
+          # Verify AWG 3.x and kernel via uncompressed .ko (apk is compressed ADB)
+          echo "=== module strings check ==="
+          ko=$(find build_dir -name 'amneziawg.ko' 2>/dev/null | head -1)
+          if [ -z "$ko" ]; then
+            echo "ERROR: amneziawg.ko not found in build_dir" >&2
+            exit 1
+          fi
+          echo "ko: $ko"
+          strings "$ko" | grep -E 'AmneziaWG|vermagic=' || true
+          strings "$ko" | grep -q 'AmneziaWG 3\.' || {
+            echo "ERROR: not AWG 3.x" >&2
+            exit 1
+          }
+          strings "$ko" | grep -q 'vermagic=6.12.94' || {
+            echo "ERROR: wrong kernel" >&2
             exit 1
           }
 
