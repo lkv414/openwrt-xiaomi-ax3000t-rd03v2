@@ -60,9 +60,27 @@ jobs:
       - name: Setup OpenWrt tree (ADCDS way + KMODS=1)
         run: |
           set -e
+          # Cache restore may create openwrt/{dl,staging_dir,build_dir} without .git.
+          # Preserve those dirs, clone into a clean tree, then put them back.
           if [ ! -d openwrt/.git ]; then
+            mkdir -p /tmp/owrt-preserve
+            for d in dl staging_dir build_dir; do
+              if [ -d "openwrt/$d" ]; then
+                mv "openwrt/$d" "/tmp/owrt-preserve/$d"
+                echo "Preserved cached openwrt/$d"
+              fi
+            done
+            rm -rf openwrt
             git clone https://github.com/openwrt/openwrt.git openwrt
+            for d in dl staging_dir build_dir; do
+              if [ -d "/tmp/owrt-preserve/$d" ]; then
+                rm -rf "openwrt/$d"
+                mv "/tmp/owrt-preserve/$d" "openwrt/$d"
+                echo "Restored cached openwrt/$d"
+              fi
+            done
           fi
+
           cd openwrt
           git fetch --depth 1 origin "$OPENWRT_COMMIT" || git fetch origin "$OPENWRT_COMMIT"
           git checkout -f "$OPENWRT_COMMIT"
@@ -90,7 +108,6 @@ jobs:
           ./scripts/feeds install -a
           ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg
 
-          # Fix -Werror=missing-prototypes in the AmneziaWG kernel patch
           PATCH=feeds/amneziawg/kmod-amneziawg/files/000-initial-amneziawg.patch
           if [ -f "$PATCH" ]; then
             sed -i \
@@ -108,8 +125,6 @@ jobs:
             echo "Patched AWG Makefile: -Wno-error=missing-prototypes"
           fi
 
-          # APK rejects versions with hyphens inside PKG_VERSION (luci had 0.0.1-1).
-          # OpenWrt expects PKG_VERSION + separate PKG_RELEASE.
           LUCI_MK=feeds/amneziawg/luci-proto-amneziawg/Makefile
           if [ -f "$LUCI_MK" ]; then
             sed -i 's/^PKG_VERSION:=0\.0\.1-1$/PKG_VERSION:=0.0.1/' "$LUCI_MK"
