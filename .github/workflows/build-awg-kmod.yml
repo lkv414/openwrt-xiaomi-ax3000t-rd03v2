@@ -6,7 +6,6 @@ on:
 env:
   OPENWRT_COMMIT: 25ee12629edcc38feffbd06255dd47840cd7af7e
   AWG_COMMIT: 56bf9fed93df48d2b747edd6e7a7c5fbe2b01afe
-  # Expected vermagic hash from ADCDS release image (plain, KMODS=1)
   EXPECTED_VERMAGIC: 22588d2e9f0a25da3a9864a6592f9e13
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
@@ -133,14 +132,10 @@ jobs:
             grep -E 'PKG_VERSION|PKG_RELEASE' "$LUCI_MK" || true
           fi
 
-      - name: Configure (exact ADCDS release set — no AWG in kernel config)
+      - name: Configure (exact ADCDS release set — no AWG yet)
         working-directory: openwrt
         run: |
           set -e
-          # IMPORTANT: do NOT select kmod-amneziawg / tools / luci here.
-          # vermagic = md5 of sorted Kernel-Config '=[ym]' symbols.
-          # Release image has no AmneziaWG feed → those packages must stay out
-          # of .config until AFTER the kernel is built.
           cat > .config << 'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq50xx=y
@@ -164,7 +159,6 @@ jobs:
             exit 1
           }
 
-          # Ensure AWG packages are not selected (defconfig must not pull them in)
           for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
             sed -i "/^CONFIG_PACKAGE_${p}=/d" .config
             echo "# CONFIG_PACKAGE_${p} is not set" >> .config
@@ -184,17 +178,48 @@ jobs:
           make toolchain/install -j"$(nproc)" IGNORE_ERRORS="n m"
           make target/linux/compile -j"$(nproc)" IGNORE_ERRORS="n m" BUILD_LOG=1
 
-          # Kernel is frozen → vermagic fixed. Now build AWG against it
-          # without changing the kernel config / vermagic.
-          make package/feeds/amneziawg/kmod-amneziawg/compile -j"$(nproc)" V=s
-          make package/feeds/amneziawg/amneziawg-tools/compile -j"$(nproc)" V=s
-          make package/feeds/amneziawg/luci-proto-amneziawg/compile -j"$(nproc)" V=s
+          # Snapshot vermagic from the frozen kernel tree
+          if [ -f .vermagic ]; then
+            echo "Kernel .vermagic after linux/compile: $(cat .vermagic)"
+            cp -a .vermagic /tmp/vermagic.after-kernel
+          fi
 
+          # Enable AWG packages ONLY now (kernel already built → vermagic stays).
+          # Do NOT run defconfig/oldconfig here — that can rewrite Kernel-Config.
+          for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            sed -i "/^# CONFIG_PACKAGE_${p} is not set/d" .config
+            sed -i "/^CONFIG_PACKAGE_${p}=/d" .config
+          done
+          {
+            echo "CONFIG_PACKAGE_kmod-amneziawg=m"
+            echo "CONFIG_PACKAGE_amneziawg-tools=y"
+            echo "CONFIG_PACKAGE_luci-proto-amneziawg=y"
+          } >> .config
+
+          # Compile + package (COMPILE only, never target/linux again)
+          make package/feeds/amneziawg/kmod-amneziawg/{clean,compile,install} -j"$(nproc)" V=s
+          make package/feeds/amneziawg/amneziawg-tools/{clean,compile,install} -j"$(nproc)" V=s
+          make package/feeds/amneziawg/luci-proto-amneziawg/{clean,compile,install} -j"$(nproc)" V=s
+
+          # Package the in-tree deps too
           for p in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-chacha20poly1305 \
                    kmod-crypto-lib-curve25519 kmod-udptunnel4 kmod-udptunnel6; do
-            make "package/$p/compile" -j"$(nproc)" 2>/dev/null || \
-              make "package/kernel/$p/compile" -j"$(nproc)" 2>/dev/null || true
+            make "package/kernel/linux/compile" -j"$(nproc)" 2>/dev/null || true
+            make "package/$p/compile" -j"$(nproc)" 2>/dev/null || true
           done
+
+          # Prove AWG actually built
+          echo "=== looking for amneziawg.ko ==="
+          find build_dir -name 'amneziawg.ko' 2>/dev/null | head -5
+          find bin -name 'kmod-amneziawg*' 2>/dev/null | head -10
+
+          if [ -f /tmp/vermagic.after-kernel ] && [ -f .vermagic ]; then
+            echo "vermagic before AWG: $(cat /tmp/vermagic.after-kernel)"
+            echo "vermagic after  AWG: $(cat .vermagic)"
+            if ! cmp -s /tmp/vermagic.after-kernel .vermagic; then
+              echo "WARNING: .vermagic changed after enabling AWG packages" >&2
+            fi
+          fi
 
           echo "=== ccache stats ==="
           ccache -s || true
@@ -248,6 +273,8 @@ jobs:
 
           test -n "$(ls /tmp/awg-out/kmod-amneziawg* 2>/dev/null)" || {
             echo "ERROR: kmod-amneziawg not built" >&2
+            echo "=== last package build logs ===" >&2
+            find logs -name '*amneziawg*' 2>/dev/null | head -20 >&2 || true
             exit 1
           }
           test -n "$(ls /tmp/awg-out/amneziawg-tools* 2>/dev/null)" || {
@@ -269,12 +296,9 @@ jobs:
               modinfo "$ko" | grep -E 'vermagic|version' || true
             fi
           fi
-          # Extract kernel= from the built apk/ipk control if possible
           for f in /tmp/awg-out/kmod-amneziawg*; do
             echo "package: $f"
-            # apk is tar; try to show depends
-            tar -xOf "$f" .PKGINFO 2>/dev/null | grep -E 'depend|origin|pkgname' || true
-            tar -xOf "$f" control 2>/dev/null | head -20 || true
+            tar -xOf "$f" .PKGINFO 2>/dev/null | grep -E 'depend|origin|pkgname|pkgver' || true
           done
 
       - name: Upload AWG packages
