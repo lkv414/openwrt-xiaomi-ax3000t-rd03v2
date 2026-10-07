@@ -5,7 +5,6 @@ on:
 
 env:
   OPENWRT_COMMIT: 25ee12629edcc38feffbd06255dd47840cd7af7e
-  # Pin AmneziaWG feed for reproducibility
   AWG_COMMIT: 56bf9fed93df48d2b747edd6e7a7c5fbe2b01afe
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
@@ -84,7 +83,6 @@ jobs:
             }
           done < ../feeds.lock
 
-          # Pin AmneziaWG feed to exact commit
           sed -i '/amneziawg-openwrt/d' feeds.conf.default
           echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git^${AWG_COMMIT}" >> feeds.conf.default
 
@@ -92,8 +90,7 @@ jobs:
           ./scripts/feeds install -a
           ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg
 
-          # ── Fix -Werror=missing-prototypes in the AmneziaWG patch ──
-          # Functions used only in one .c file must be static.
+          # Fix -Werror=missing-prototypes in the AmneziaWG kernel patch
           PATCH=feeds/amneziawg/kmod-amneziawg/files/000-initial-amneziawg.patch
           if [ -f "$PATCH" ]; then
             sed -i \
@@ -105,11 +102,20 @@ jobs:
             echo "Patched AWG: missing-prototype helpers → static"
           fi
 
-          # Safety net: don't treat remaining missing-prototypes as errors
           MK=feeds/amneziawg/kmod-amneziawg/Makefile
           if [ -f "$MK" ] && ! grep -q 'Wno-error=missing-prototypes' "$MK"; then
             sed -i 's|EXTRA_CFLAGS="\$(BUILDFLAGS)"|EXTRA_CFLAGS="\$(BUILDFLAGS) -Wno-error=missing-prototypes -Wno-missing-prototypes"|' "$MK"
             echo "Patched AWG Makefile: -Wno-error=missing-prototypes"
+          fi
+
+          # APK rejects versions with hyphens inside PKG_VERSION (luci had 0.0.1-1).
+          # OpenWrt expects PKG_VERSION + separate PKG_RELEASE.
+          LUCI_MK=feeds/amneziawg/luci-proto-amneziawg/Makefile
+          if [ -f "$LUCI_MK" ]; then
+            sed -i 's/^PKG_VERSION:=0\.0\.1-1$/PKG_VERSION:=0.0.1/' "$LUCI_MK"
+            grep -q '^PKG_RELEASE:=' "$LUCI_MK" || sed -i '/^PKG_VERSION:=/a PKG_RELEASE:=1' "$LUCI_MK"
+            echo "Patched luci-proto-amneziawg version for APK:"
+            grep -E 'PKG_VERSION|PKG_RELEASE' "$LUCI_MK" || true
           fi
 
       - name: Configure (match ADCDS release + ALL_KMODS + ccache)
@@ -154,18 +160,14 @@ jobs:
           export PATH="/usr/lib/ccache:$PATH"
           export CCACHE_DIR="${{ github.workspace }}/.ccache"
 
-          # IGNORE_ERRORS: one broken optional kmod must not kill the kernel build
-          # (same as ADCDS build.sh / OpenWrt buildbot)
           make tools/install -j"$(nproc)" IGNORE_ERRORS="n m"
           make toolchain/install -j"$(nproc)" IGNORE_ERRORS="n m"
           make target/linux/compile -j"$(nproc)" IGNORE_ERRORS="n m" BUILD_LOG=1
 
-          # AWG itself must succeed (no IGNORE_ERRORS)
           make package/feeds/amneziawg/kmod-amneziawg/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/amneziawg-tools/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/luci-proto-amneziawg/compile -j"$(nproc)" V=s
 
-          # Deps into bin/ (best-effort)
           for p in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-chacha20poly1305 \
                    kmod-crypto-lib-curve25519 kmod-udptunnel4 kmod-udptunnel6; do
             make "package/$p/compile" -j"$(nproc)" 2>/dev/null || \
@@ -175,7 +177,6 @@ jobs:
           echo "=== ccache stats ==="
           ccache -s || true
 
-      # Save caches even if compile failed (so next run is faster)
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
