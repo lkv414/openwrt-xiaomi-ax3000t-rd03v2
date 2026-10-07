@@ -6,6 +6,8 @@ on:
 env:
   OPENWRT_COMMIT: 25ee12629edcc38feffbd06255dd47840cd7af7e
   AWG_COMMIT: 56bf9fed93df48d2b747edd6e7a7c5fbe2b01afe
+  # Expected vermagic hash from ADCDS release image (plain, KMODS=1)
+  EXPECTED_VERMAGIC: 22588d2e9f0a25da3a9864a6592f9e13
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
 
@@ -32,7 +34,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v4
           restore-keys: |
             ccache-${{ env.OPENWRT_COMMIT }}-
             ccache-
@@ -41,7 +43,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: openwrt/dl
-          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v4
           restore-keys: |
             owrt-dl-${{ env.OPENWRT_COMMIT }}-
             owrt-dl-
@@ -53,15 +55,13 @@ jobs:
             openwrt/staging_dir
             openwrt/build_dir/host
             openwrt/build_dir/toolchain-*
-          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v4
           restore-keys: |
             owrt-tc-${{ env.OPENWRT_COMMIT }}-
 
       - name: Setup OpenWrt tree (ADCDS way + KMODS=1)
         run: |
           set -e
-          # Cache restore may create openwrt/{dl,staging_dir,build_dir} without .git.
-          # Preserve those dirs, clone into a clean tree, then put them back.
           if [ ! -d openwrt/.git ]; then
             mkdir -p /tmp/owrt-preserve
             for d in dl staging_dir build_dir; do
@@ -133,10 +133,14 @@ jobs:
             grep -E 'PKG_VERSION|PKG_RELEASE' "$LUCI_MK" || true
           fi
 
-      - name: Configure (match ADCDS release + ALL_KMODS + ccache)
+      - name: Configure (exact ADCDS release set — no AWG in kernel config)
         working-directory: openwrt
         run: |
           set -e
+          # IMPORTANT: do NOT select kmod-amneziawg / tools / luci here.
+          # vermagic = md5 of sorted Kernel-Config '=[ym]' symbols.
+          # Release image has no AmneziaWG feed → those packages must stay out
+          # of .config until AFTER the kernel is built.
           cat > .config << 'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq50xx=y
@@ -151,11 +155,6 @@ jobs:
           CONFIG_PACKAGE_ethtool=y
           CONFIG_PACKAGE_i2c-tools=y
           CONFIG_ALL_KMODS=y
-          CONFIG_PACKAGE_kmod-amneziawg=m
-          CONFIG_PACKAGE_amneziawg-tools=y
-          CONFIG_PACKAGE_luci-proto-amneziawg=y
-          CONFIG_CCACHE=y
-          CONFIG_DEVEL=y
           EOF
           sed -i 's/^[[:space:]]*//' .config
           make defconfig
@@ -164,6 +163,12 @@ jobs:
             echo "ERROR: CONFIG_ALL_KMODS was lost after defconfig" >&2
             exit 1
           }
+
+          # Ensure AWG packages are not selected (defconfig must not pull them in)
+          for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            sed -i "/^CONFIG_PACKAGE_${p}=/d" .config
+            echo "# CONFIG_PACKAGE_${p} is not set" >> .config
+          done
 
           make download -j"$(nproc)" || true
 
@@ -179,6 +184,8 @@ jobs:
           make toolchain/install -j"$(nproc)" IGNORE_ERRORS="n m"
           make target/linux/compile -j"$(nproc)" IGNORE_ERRORS="n m" BUILD_LOG=1
 
+          # Kernel is frozen → vermagic fixed. Now build AWG against it
+          # without changing the kernel config / vermagic.
           make package/feeds/amneziawg/kmod-amneziawg/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/amneziawg-tools/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/luci-proto-amneziawg/compile -j"$(nproc)" V=s
@@ -197,14 +204,14 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .ccache
-          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+          key: ccache-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v4
 
       - name: Save OpenWrt dl
         if: always()
         uses: actions/cache/save@v4
         with:
           path: openwrt/dl
-          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+          key: owrt-dl-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v4
 
       - name: Save OpenWrt toolchain
         if: always()
@@ -214,7 +221,7 @@ jobs:
             openwrt/staging_dir
             openwrt/build_dir/host
             openwrt/build_dir/toolchain-*
-          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v3
+          key: owrt-tc-${{ env.OPENWRT_COMMIT }}-${{ hashFiles('feeds.lock') }}-v4
 
       - name: Collect artifacts and check vermagic
         working-directory: openwrt
@@ -252,17 +259,23 @@ jobs:
             exit 1
           }
 
+          echo "=== vermagic check (want ${EXPECTED_VERMAGIC}) ==="
+          if [ -f .vermagic ]; then
+            echo "tree .vermagic: $(cat .vermagic)"
+          fi
           if command -v modinfo >/dev/null 2>&1; then
             ko=$(find build_dir -name 'amneziawg.ko' 2>/dev/null | head -1)
             if [ -n "$ko" ]; then
-              echo "=== vermagic from amneziawg.ko ==="
               modinfo "$ko" | grep -E 'vermagic|version' || true
             fi
           fi
-          if [ -f .vermagic ]; then
-            echo "=== .vermagic ==="
-            cat .vermagic
-          fi
+          # Extract kernel= from the built apk/ipk control if possible
+          for f in /tmp/awg-out/kmod-amneziawg*; do
+            echo "package: $f"
+            # apk is tar; try to show depends
+            tar -xOf "$f" .PKGINFO 2>/dev/null | grep -E 'depend|origin|pkgname' || true
+            tar -xOf "$f" control 2>/dev/null | head -20 || true
+          done
 
       - name: Upload AWG packages
         uses: actions/upload-artifact@v4
