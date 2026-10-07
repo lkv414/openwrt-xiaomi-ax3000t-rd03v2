@@ -5,7 +5,7 @@ on:
 
 env:
   OPENWRT_COMMIT: 25ee12629edcc38feffbd06255dd47840cd7af7e
-  AWG_COMMIT: 56bf9fed93df48d2b747edd6e7a7c5fbe2b01afe
+  AWG_COMMIT: 01c4ad754d8fd04256bad962f7e6375ca98ec776
   EXPECTED_VERMAGIC: 22588d2e9f0a25da3a9864a6592f9e13
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 2G
@@ -107,36 +107,18 @@ jobs:
             }
           done < ../feeds.lock
 
-          sed -i '/amneziawg-openwrt/d' feeds.conf.default
-          echo "src-git amneziawg https://github.com/amnezia-vpn/amneziawg-openwrt.git^${AWG_COMMIT}" >> feeds.conf.default
+          sed -i '/amneziawg/d' feeds.conf.default
+          echo "src-git amneziawg https://github.com/samara1531/awg2.git^${AWG_COMMIT}" >> feeds.conf.default
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           ./scripts/feeds install kmod-amneziawg amneziawg-tools luci-proto-amneziawg
 
-          PATCH=feeds/amneziawg/kmod-amneziawg/files/000-initial-amneziawg.patch
-          if [ -f "$PATCH" ]; then
-            sed -i \
-              -e 's/^\(+\)u32 wg_get_random_u32_inclusive/\1static u32 wg_get_random_u32_inclusive/' \
-              -e 's/^\(+\)void prepare_advanced_secured_message/\1static void prepare_advanced_secured_message/' \
-              "$PATCH"
-            grep -q 'static u32 wg_get_random_u32_inclusive' "$PATCH"
-            grep -q 'static void prepare_advanced_secured_message' "$PATCH"
-            echo "Patched AWG: missing-prototype helpers → static"
-          fi
-
+          # Keep EXTRA_CFLAGS fix for missing-prototypes (still applies to new Makefile)
           MK=feeds/amneziawg/kmod-amneziawg/Makefile
           if [ -f "$MK" ] && ! grep -q 'Wno-error=missing-prototypes' "$MK"; then
             sed -i 's|EXTRA_CFLAGS="\$(BUILDFLAGS)"|EXTRA_CFLAGS="\$(BUILDFLAGS) -Wno-error=missing-prototypes -Wno-missing-prototypes"|' "$MK"
             echo "Patched AWG Makefile: -Wno-error=missing-prototypes"
-          fi
-
-          LUCI_MK=feeds/amneziawg/luci-proto-amneziawg/Makefile
-          if [ -f "$LUCI_MK" ]; then
-            sed -i 's/^PKG_VERSION:=0\.0\.1-1$/PKG_VERSION:=0.0.1/' "$LUCI_MK"
-            grep -q '^PKG_RELEASE:=' "$LUCI_MK" || sed -i '/^PKG_VERSION:=/a PKG_RELEASE:=1' "$LUCI_MK"
-            echo "Patched luci-proto-amneziawg version for APK:"
-            grep -E 'PKG_VERSION|PKG_RELEASE' "$LUCI_MK" || true
           fi
 
       - name: Configure (exact ADCDS release set — no AWG yet)
@@ -193,7 +175,7 @@ jobs:
 
           # Enable AWG packages ONLY now (kernel already built → vermagic stays).
           # Do NOT run defconfig/oldconfig here — that can rewrite Kernel-Config.
-          for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+          for p in kmod-amneziawg amneziawg-tools luci-proto-amneziawg ucode luci-lib-uqr resolveip; do
             sed -i "/^# CONFIG_PACKAGE_${p} is not set/d" .config
             sed -i "/^CONFIG_PACKAGE_${p}=/d" .config
           done
@@ -201,19 +183,22 @@ jobs:
             echo "CONFIG_PACKAGE_kmod-amneziawg=m"
             echo "CONFIG_PACKAGE_amneziawg-tools=y"
             echo "CONFIG_PACKAGE_luci-proto-amneziawg=y"
+            echo "CONFIG_PACKAGE_ucode=y"
+            echo "CONFIG_PACKAGE_luci-lib-uqr=y"
+            echo "CONFIG_PACKAGE_resolveip=y"
           } >> .config
 
-          # AWG packages: oldconfig so packages appear in tmp/.config, then compile only
-          yes '' | make oldconfig >/tmp/oldconfig.log 2>&1 || true
+          # Compile only (no install target for package/*/)
           make package/feeds/amneziawg/kmod-amneziawg/clean -j"$(nproc)" || true
           make package/feeds/amneziawg/kmod-amneziawg/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/amneziawg-tools/compile -j"$(nproc)" V=s
           make package/feeds/amneziawg/luci-proto-amneziawg/compile -j"$(nproc)" V=s
 
-          # Package the in-tree deps too
+          # crypto-модули лежат в package/kernel/crypto, таргетов вида package/<имя>/compile нет
           make "package/kernel/crypto/compile" -j"$(nproc)" 2>/dev/null || true
-          for p in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-chacha20poly1305 \
-                   kmod-crypto-lib-poly1305 kmod-crypto-lib-curve25519 \
+
+          for p in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-poly1305 \
+                   kmod-crypto-lib-chacha20poly1305 kmod-crypto-lib-curve25519 \
                    kmod-udptunnel4 kmod-udptunnel6; do
             make "package/kernel/linux/compile" -j"$(nproc)" 2>/dev/null || true
             make "package/$p/compile" -j"$(nproc)" 2>/dev/null || true
@@ -281,6 +266,9 @@ jobs:
             -name 'kmod-amneziawg*.apk' -o -name 'kmod-amneziawg*.ipk' -o \
             -name 'amneziawg-tools*.apk' -o -name 'amneziawg-tools*.ipk' -o \
             -name 'luci-proto-amneziawg*.apk' -o -name 'luci-proto-amneziawg*.ipk' -o \
+            -name 'ucode*.apk' -o -name 'ucode*.ipk' -o \
+            -name 'luci-lib-uqr*.apk' -o -name 'luci-lib-uqr*.ipk' -o \
+            -name 'resolveip*.apk' -o -name 'resolveip*.ipk' -o \
             -name 'kmod-crypto-kpp*.apk' -o -name 'kmod-crypto-kpp*.ipk' -o \
             -name 'kmod-crypto-lib-chacha20*.apk' -o -name 'kmod-crypto-lib-chacha20*.ipk' -o \
             -name 'kmod-crypto-lib-chacha20poly1305*.apk' -o -name 'kmod-crypto-lib-chacha20poly1305*.ipk' -o \
@@ -295,46 +283,35 @@ jobs:
           echo "=== Artifacts ==="
           ls -la /tmp/awg-out/
 
-          # Hard checks: main AWG packages
-          test -n "$(ls /tmp/awg-out/kmod-amneziawg* 2>/dev/null)" || {
-            echo "ERROR: kmod-amneziawg not built" >&2
-            echo "=== last package build logs ===" >&2
-            find logs -name '*amneziawg*' 2>/dev/null | head -20 >&2 || true
-            exit 1
-          }
-          test -n "$(ls /tmp/awg-out/amneziawg-tools* 2>/dev/null)" || {
-            echo "ERROR: amneziawg-tools not built" >&2
-            exit 1
-          }
-          test -n "$(ls /tmp/awg-out/luci-proto-amneziawg* 2>/dev/null)" || {
-            echo "ERROR: luci-proto-amneziawg not built" >&2
-            exit 1
-          }
-
-          # Hard checks: crypto/tunnel kmods required by AWG
-          for pkg in kmod-crypto-kpp kmod-crypto-lib-chacha20 kmod-crypto-lib-chacha20poly1305 \
-                     kmod-crypto-lib-poly1305 kmod-crypto-lib-curve25519 \
-                     kmod-udptunnel4 kmod-udptunnel6; do
-            test -n "$(ls /tmp/awg-out/${pkg}* 2>/dev/null)" || {
-              echo "ERROR: $pkg not present in artifacts" >&2
+          # Hard checks: required packages must be present
+          for p in kmod-amneziawg amneziawg-tools kmod-crypto-kpp \
+                   kmod-crypto-lib-chacha20 kmod-crypto-lib-poly1305 \
+                   kmod-crypto-lib-chacha20poly1305 kmod-crypto-lib-curve25519 \
+                   kmod-udptunnel4 kmod-udptunnel6; do
+            ls /tmp/awg-out/${p}*.apk >/dev/null 2>&1 || {
+              echo "ERROR: ${p} missing in artifacts" >&2
+              ls -la /tmp/awg-out/ >&2
               exit 1
             }
           done
 
-          echo "=== vermagic check (want ${EXPECTED_VERMAGIC}) ==="
-          if [ -f .vermagic ]; then
-            echo "tree .vermagic: $(cat .vermagic)"
-          fi
-          if command -v modinfo >/dev/null 2>&1; then
-            ko=$(find build_dir -name 'amneziawg.ko' 2>/dev/null | head -1)
-            if [ -n "$ko" ]; then
-              modinfo "$ko" | grep -E 'vermagic|version' || true
-            fi
-          fi
-          for f in /tmp/awg-out/kmod-amneziawg*; do
-            echo "package: $f"
-            tar -xOf "$f" .PKGINFO 2>/dev/null | grep -E 'depend|origin|pkgname|pkgver' || true
+          # Version must be 3.1.x (not the abandoned 0.0.1 / 1.0 feed)
+          ls /tmp/awg-out/kmod-amneziawg-6.12.94.3.1.*.apk >/dev/null 2>&1 || {
+            echo "ERROR: kmod-amneziawg is not 3.1.x" >&2
+            ls /tmp/awg-out/kmod-amneziawg* >&2
+            exit 1
+          }
+
+          # Kernel dependency check via binary grep (apk is ADB, not tar)
+          echo "=== kernel dependency check (want ${EXPECTED_VERMAGIC}) ==="
+          for f in /tmp/awg-out/kmod-*.apk; do
+            got=$(grep -a -o -m1 '6\.12\.94~[0-9a-f]\{32\}' "$f" || true)
+            echo "$(basename "$f"): ${got:-not-found}"
           done
+          grep -a -q "6.12.94~${EXPECTED_VERMAGIC}" /tmp/awg-out/kmod-amneziawg*.apk || {
+            echo "ERROR: kmod-amneziawg depends on a different kernel" >&2
+            exit 1
+          }
 
       - name: Upload AWG packages
         uses: actions/upload-artifact@v4
